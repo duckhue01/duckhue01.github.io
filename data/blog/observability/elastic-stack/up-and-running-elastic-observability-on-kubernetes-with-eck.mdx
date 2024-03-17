@@ -1,0 +1,219 @@
+---
+title: 'Up and Running Elastic Observability on Kubernetes with ECK'
+date: '2023-08-15'
+tags: ['observability', 'elastic', 'setup', 'kubernetes']
+draft: true
+summary: This article will help you install up and running Elastic stack for observability purpose with ECK operator on Kubernetes cluster
+---
+
+<TOCInline toc={props.toc}  />
+
+## Introduction
+
+We have several ways to deploy Elastic Observability solution to Kubernetes cluster.
+
+In this article, We will walk through the process of setting up and running Elastic Observability stack by using ECK(Elastic Cloud on Kubernetes) Operator.
+
+Built on the Kubernetes Operator pattern, ECK extends the basic Kubernetes orchestration capabilities to support the setup and management of Elasticsearch, Kibana, APM Server, Enterprise Search, Beats, Elastic Agent, Elastic Maps Server, and Logstash on Kubernetes.
+
+## Prerequisites
+
+- Fully functional Kubernetes cluster
+- Your Kubernetes cluster version is supported by Operator. Checking https://www.elastic.co/guide/en/cloud-on-k8s/current/k8s-quickstart.html
+- ECK Operator version 2.11.1
+
+## Step 1: Install ECK Operator & CRDs
+You can download kubernetes manifests to your local machine to look what inside:
+
+To download CRDs manifests:
+```bash
+curl -L -O https://download.elastic.co/downloads/eck/2.11.1/crds.yaml
+```
+This file include all CRDs like `Elasticseach`, `Kibana`, `Agent`,...
+
+To download ECK operator:
+```bash 
+curl -O ttps://download.elastic.co/downloads/eck/2.11.1/operator.yaml
+```
+This file contans all resource needed to run ECK operator like `StatefulSet`, `ConfigMap`, `ClusterRole`,...
+
+After review these manifiests, you can apply to your cluster:
+```bash
+kubectl apply -f crds.yaml
+kubectl apply -f operator.yaml
+```
+
+And monitor the Operator logs to know if there are some things bad has happened:
+```bash
+kubectl -n elastic-system logs -f statefulset.apps/elastic-operator
+```
+
+If everything is fine you can move on to the next step:
+
+## Step 2: Create ElasticSearch & Kibana
+To install Elasticsearch with default configuration apply following manifest:
+```yaml
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: elasticsearch
+spec:
+  version: 8.12.1
+  nodeSets:
+    - name: default
+      count: 1
+      config:
+        node.store.allow_mmap: false
+```
+By default, the operator create a `PersistentVolumeClaim` with a capacity of 1Gi and with default `StorageClass`. So if you don't have default `StorageClass` you must create `PersistentVolumeClaim` or `StorageClass` then update `.spec.nodeSets[].volumeClaimTemplates` to claim that volume. Here is an example of claim template using `StorageClass`:
+```yaml
+spec:
+  nodeSets:
+  - name: default
+    count: 1
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data # Do not change this name unless you set up a volume mount for the data path.
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+        storageClassName: standard
+```
+
+After `Elasticsearch` is up and running we can next install `Kibana`:
+```yaml
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: kibana
+spec:
+  version: 8.12.1
+  count: 1
+  elasticsearchRef:
+    name: elasticsearch
+```
+As can see, ECK operator handle for us conntection, TLS, authentication between Kibana & Elasticseach just by specify `.spec.lasticsearchRef`.
+
+To access Kibana dashboard you need to forward the `Kibana` port to your local ennvironment:
+```bash
+kubectl port-forward svc/kibana-kb-http  5601
+```
+And get `elastic` password:
+```bash
+kubectl get secrets elasticsearch-es-elastic-user -o jsonpath='{.data.elastic}' | base64 -D; echo
+```
+
+Open https://localhost:5601 in your browser. Your browser will show a warning because the self-signed certificate configured by default is not verified by a known certificate authority and not trusted by your browser.
+
+## Step 3: Create ElasticAgent
+`ElasticAgent` is single deployment unit, unified way to add monitoring for logs, metrics and and other type of data to your host. It's built on top of `Filebeat`, `Metricbeat`,...
+
+`ElasticAgent` has following notable advantages:
+- Central management with `Fleet`. For example, you have `ElasticAgent` are deployed on multiple host what will soon become the management problem
+- With `Intergration` you can quickly get your monitoring solution up and running. It will generate agent policy for your specific host ennvironment.
+- Reduce the burden of managing small components of Elastic stack like `Filebeat`, `Metricbeat`,...
+
+![Elastic Agent](/static/images/observability/elastic-stack/agent-architecture.png)
+
+`ElasticAgent` has two deployment modes:
+- `Standalone`: You manually config and manage `ElasticAgent` policy on the host where you deploy it.
+- `Fleet`: #todo
+
+In the scope of of this blog, we will use `Standalone` mode to deploy `ElasticAgent`.
+
+### Create Kubernetes Intergration on Kibana
+`Kubernetes Intergration` requires kube-state-metrics, which is not included with Kubernetes by default. For dashboards to properly populate, the [kube-state-metrics](https://github.com/kubernetes/kube-state-metrics) service must be deployed to your Kubernetes cluster
+
+In `Intergration` section search for `Kubernetes` > `Add Kubernetes` > `Save and Continue` > `Add Elastic Agent to your hosts` > `Run standalone` > `Copy to clipboard`
+![Kubernetes Intergration](/static/images/observability/elastic-stack/kubernetes-intergration.png)
+
+### Config Elastic Agent
+Create `agent.yaml` with the content that you previously copied. It has `ConfigMap`, `DaemonSet`, `ClusterRole`, `ClusterRoleBindding`,...
+
+Change user name & password to allow `ElasticAgent` connects to `Elasticseach`:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-node-datastreams
+  namespace: default
+  labels:
+    k8s-app: elastic-agent
+data:
+  agent.yml: |-
+    id: f97f5e26-a099-4ecd-948e-ec58790992d9
+    outputs:
+      default:
+        type: elasticsearch
+        hosts:
+          - "https://elasticsearch-es-http.default.svc:9200"
+        username: <your username>
+        password: <your password>
+```
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: elastic-agent
+  namespace: default
+  labels:
+    app: elastic-agent
+spec:
+  selector:
+    matchLabels:
+      app: elastic-agent
+  template:
+    metadata:
+      labels:
+        app: elastic-agent
+    spec:
+      # Tolerations are needed to run Elastic Agent on Kubernetes control-plane nodes.
+      # Agents running on control-plane nodes collect metrics from the control plane components (scheduler, controller manager) of Kubernetes
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          effect: NoSchedule
+      serviceAccountName: elastic-agent
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Uncomment if using hints feature
+      #initContainers:
+      #  - name: k8s-templates-downloader
+      #    image: busybox:1.28
+      #    command: ['sh']
+      #    args:
+      #      - -c
+      #      - >-
+      #        mkdir -p /etc/elastic-agent/inputs.d &&
+      #        wget -O - https://github.com/elastic/elastic-agent/archive/8.12.tar.gz | tar xz -C /etc/elastic-agent/inputs.d --strip=5 "elastic-agent-8.12/deploy/kubernetes/elastic-agent/templates.d"
+      #    volumeMounts:
+      #      - name: external-inputs
+      #        mountPath: /etc/elastic-agent/inputs.d
+      containers:
+        - name: elastic-agent
+          image: docker.elastic.co/beats/elastic-agent:8.12.2
+          args: ["-c", "/etc/elastic-agent/agent.yml", "-e"]
+          env:
+            # The basic authentication username used to connect to Elasticsearch
+            # This user needs the privileges required to publish events to Elasticsearch.
+            - name: ES_USERNAME
+              value: "elastic"
+            # The basic authentication password used to connect to Elasticsearch
+            - name: ES_PASSWORD
+              value: <your password>
+...
+```
+
+From now you can see pre-configured dashboards and logs from your Kubernetes cluster.
+
+## Wrapping Up
+That's all for my "Setup Up and Running" article. I hope that this article will help you get familiar with the Elastic observability solution on Kubernetes.
+
+## References
+https://www.elastic.co/guide/en/cloud-on-k8s/current/k8s-overview.html
+https://kubernetes.io/docs/concepts/extend-kubernetes/operator/
