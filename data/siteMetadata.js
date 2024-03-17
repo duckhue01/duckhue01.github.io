@@ -3,7 +3,7 @@ const siteMetadata = {
   title: 'DK',
   author: 'duckhue01',
   // headerTitle: 'DK',
-  description: 'A blog created with ♥️ by duckhue01',
+  description: 'A blog site created with ♥️ by duckhue01',
   language: 'en-us',
   theme: 'system', // system, dark or light
   siteUrl: 'https://duckhue01.github.io',
